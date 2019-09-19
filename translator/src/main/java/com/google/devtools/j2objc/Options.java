@@ -17,6 +17,7 @@ package com.google.devtools.j2objc;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Splitter;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Sets;
 import com.google.common.io.Files;
 import com.google.common.io.Resources;
@@ -37,6 +38,7 @@ import java.net.URL;
 import java.nio.charset.UnsupportedCharsetException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.EnumSet;
 import java.util.Iterator;
 import java.util.List;
@@ -59,7 +61,7 @@ public class Options {
   private List<String> processorPathEntries = new ArrayList<>();
   private OutputLanguageOption language = OutputLanguageOption.OBJECTIVE_C;
   private MemoryManagementOption memoryManagementOption = null;
-  private boolean emitLineDirectives = false;
+  private EmitLineDirectivesOption emitLineDirectives = EmitLineDirectivesOption.NONE;
   private boolean warningsAsErrors = false;
   private boolean deprecatedDeclarations = false;
   private HeaderMap headerMap = new HeaderMap();
@@ -97,7 +99,7 @@ public class Options {
   private final ExternalAnnotations externalAnnotations = new ExternalAnnotations();
   private final List<String> entryClasses = new ArrayList<>();
 
-  private SourceVersion sourceVersion = SourceVersion.defaultVersion();
+  private SourceVersion sourceVersion = null;
 
   private static File proGuardUsageFile = null;
 
@@ -193,6 +195,23 @@ public class Options {
   }
 
   /**
+   * Different ways that #line debug directives can be emitted.
+   */
+  private enum EmitLineDirectivesOption {
+    // Don't emit #line directives.
+    NONE,
+
+    // Emit #line directives using the unmodified source file path of the compilation unit; this may
+    // be an absolute path or a relative path.
+    NORMAL,
+
+    // Emit #line directives using the source file path of the compilation unit converted to a
+    // relative path, relative to the current working directory; if the file is not in a
+    // subdirectory of the current working directory then the emitted path is the same as NORMAL.
+    RELATIVE,
+  }
+
+  /**
    * Class that holds the information needed to generate combined output, so that all output goes to
    * a single, named .h/.m file set.
    */
@@ -214,6 +233,11 @@ public class Options {
       return combinedUnit;
     }
   }
+
+  // Flags that are directly forwarded to the javac parser.
+  private static final ImmutableSet<String> PLATFORM_MODULE_SYSTEM_OPTIONS =
+      ImmutableSet.of("--patch-module", "--system", "--add-reads");
+  private final List<String> platformModuleSystemOptions = new ArrayList<>();
 
 
   static {
@@ -359,12 +383,16 @@ public class Options {
         setGlobalCombinedOutput(getArgValue(args, arg));
       } else if (arg.equals("-XincludeGeneratedSources")) {
         headerMap.setIncludeGeneratedSources();
+      } else if (arg.equals("-Xpublic-hdrs")) {
+        fileUtil.setHeaderOutputDirectory(new File(getArgValue(args, arg)));
       } else if (arg.equals("-use-arc")) {
         checkMemoryManagementOption(MemoryManagementOption.ARC);
       } else if (arg.equals("-g")) {
-        emitLineDirectives = true;
+        emitLineDirectives = EmitLineDirectivesOption.NORMAL;
       } else if (arg.equals("-g:none")) {
-        emitLineDirectives = false;
+        emitLineDirectives = EmitLineDirectivesOption.NONE;
+      } else if (arg.equals("-g:relative")) {
+        emitLineDirectives = EmitLineDirectivesOption.RELATIVE;
       } else if (arg.equals("-Werror")) {
         warningsAsErrors = true;
       } else if (arg.equals("--generate-deprecated")) {
@@ -474,8 +502,10 @@ public class Options {
         emitKytheMappings = true;
       } else if (arg.equals("-Xno-source-headers")) {
         emitSourceHeaders = false;
-      } else if (arg.equals("-Xexternal-annotation-file")) {
+      } else if (arg.equals("-external-annotation-file")) {
         addExternalAnnotationFile(getArgValue(args, arg));
+      } else if (arg.equals("--reserved-names")) {
+        NameTable.addReservedNames(getArgValue(args, arg));
       } else if (arg.equals("-version")) {
         version();
       } else if (arg.startsWith("-h") || arg.equals("--help")) {
@@ -487,22 +517,14 @@ public class Options {
         // Handle aliasing of version numbers as supported by javac.
         try {
           sourceVersion = SourceVersion.parse(s);
-          // TODO(tball): remove when Java 9 source is supported.
-          if (sourceVersion == SourceVersion.JAVA_9) {
-            ErrorUtil.warning("Java 9 source version is not supported, using Java 8.");
-            sourceVersion = SourceVersion.JAVA_8;
-          }
-          // TODO(tball): remove when Java 10 source is supported.
-          if (sourceVersion == SourceVersion.JAVA_10) {
-            ErrorUtil.warning("Java 10 source version is not supported, using Java 8.");
-            sourceVersion = SourceVersion.JAVA_8;
-          }
         } catch (IllegalArgumentException e) {
           usage("invalid source release: " + s);
         }
       } else if (arg.equals("-target")) {
         // Dummy out passed target argument, since we don't care about target.
         getArgValue(args, arg);  // ignore
+      } else if (PLATFORM_MODULE_SYSTEM_OPTIONS.contains(arg)) {
+        addPlatformModuleSystemOptions(arg, getArgValue(args, arg));
       } else if (arg.startsWith(BATCH_PROCESSING_MAX_FLAG)) {
         // Ignore, batch processing isn't used with javac front-end.
       } else if (obsoleteFlags.contains(arg)) {
@@ -519,6 +541,7 @@ public class Options {
   }
 
   private void postProcessArgs() {
+    postProcessSourceVersion();
     // Fix up the classpath, adding the current dir if it is empty, as javac would.
     List<String> classPaths = fileUtil.getClassPathEntries();
     if (classPaths.isEmpty()) {
@@ -563,6 +586,24 @@ public class Options {
     if (bootclasspath == null) {
       // Fall back to Java 8 and earlier property.
       bootclasspath = System.getProperty("sun.boot.class.path", "");
+    }
+  }
+
+  private void postProcessSourceVersion() {
+    if (sourceVersion == null) {
+      sourceVersion = SourceVersion.defaultVersion();
+    }
+    SourceVersion maxVersion = SourceVersion.getMaxSupportedVersion();
+    if (sourceVersion.version() > maxVersion.version()) {
+      ErrorUtil.warning("Java " + sourceVersion.version() + " source version is not "
+          + "supported, using Java " + maxVersion.version() + ".");
+      sourceVersion = maxVersion;
+    }
+    if (sourceVersion.version() > 8) {
+      // Allow the modularized JRE to read the J2ObjC annotations (they are in the unnamed module).
+      addPlatformModuleSystemOptions("--add-reads", "java.base=ALL-UNNAMED");
+    } else {
+      platformModuleSystemOptions.clear();
     }
   }
 
@@ -678,11 +719,21 @@ public class Options {
   }
 
   public boolean emitLineDirectives() {
-    return emitLineDirectives;
+    return emitLineDirectives != EmitLineDirectivesOption.NONE;
   }
 
+  @VisibleForTesting
   public void setEmitLineDirectives(boolean b) {
-    emitLineDirectives = b;
+    emitLineDirectives = b ? EmitLineDirectivesOption.NORMAL : EmitLineDirectivesOption.NONE;
+  }
+
+  public boolean emitRelativeLineDirectives() {
+    return emitLineDirectives == EmitLineDirectivesOption.RELATIVE;
+  }
+
+  @VisibleForTesting
+  public void setEmitRelativeLineDirectives() {
+    emitLineDirectives = EmitLineDirectivesOption.RELATIVE;
   }
 
   public boolean treatWarningsAsErrors() {
@@ -844,6 +895,7 @@ public class Options {
   @VisibleForTesting
   public void setSourceVersion(SourceVersion version) {
     sourceVersion = version;
+    postProcessSourceVersion();
   }
 
   public boolean staticAccessorMethods() {
@@ -962,5 +1014,13 @@ public class Options {
 
   public List<String> entryClasses() {
     return entryClasses;
+  }
+
+  public void addPlatformModuleSystemOptions(String... flags) {
+    Collections.addAll(platformModuleSystemOptions, flags);
+  }
+
+  public List<String> getPlatformModuleSystemOptions() {
+    return platformModuleSystemOptions;
   }
 }

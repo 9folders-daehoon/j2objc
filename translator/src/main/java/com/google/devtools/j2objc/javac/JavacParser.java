@@ -27,25 +27,29 @@ import com.google.devtools.j2objc.util.Parser;
 import com.google.devtools.j2objc.util.PathClassLoader;
 import com.google.devtools.j2objc.util.SourceVersion;
 import com.sun.source.tree.CompilationUnitTree;
-import com.sun.tools.javac.api.JavacTaskImpl;
-import com.sun.tools.javac.file.JavacFileManager;
-import com.sun.tools.javac.tree.JCTree;
+import com.sun.source.util.JavacTask;
+import com.sun.source.util.SourcePositions;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.StreamTokenizer;
 import java.io.StringReader;
+import java.io.UnsupportedEncodingException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.ServiceLoader;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import javax.annotation.processing.Processor;
 import javax.tools.Diagnostic;
 import javax.tools.DiagnosticCollector;
 import javax.tools.JavaCompiler;
 import javax.tools.JavaFileManager.Location;
 import javax.tools.JavaFileObject;
+import javax.tools.StandardJavaFileManager;
 import javax.tools.StandardLocation;
 import javax.tools.ToolProvider;
 
@@ -56,10 +60,22 @@ import javax.tools.ToolProvider;
  */
 public class JavacParser extends Parser {
 
-  private JavacFileManager fileManager;
+  private StandardJavaFileManager fileManager;
 
   public JavacParser(Options options){
     super(options);
+  }
+
+  @Override
+  public String version() {
+    // Avoid using private API (Java 9+) to get version string.
+    try {
+      ByteArrayOutputStream out = new ByteArrayOutputStream();
+      ToolProvider.getSystemJavaCompiler().run(null, null, out, "-version");
+      return out.toString("UTF-8").trim();
+    } catch (UnsupportedEncodingException e) {
+      return "javac version not available";
+    }
   }
 
   @Override
@@ -71,6 +87,14 @@ public class JavacParser extends Parser {
   public CompilationUnit parse(InputFile file) {
     try {
       if (file.getUnitName().endsWith(".java")) {
+        if (file instanceof RegularInputFile) {
+          // Avoid creating an in-memory file.
+          CompilationUnit[] result = new CompilationUnit[1];
+          Parser.Handler handler = (String path, CompilationUnit unit) -> result[0] = unit;
+          parseFiles(Collections.singletonList(file.getAbsolutePath()), handler,
+              options.getSourceVersion());
+          return result[0];
+        }
         String source = options.fileUtil().readFile(file);
         return parse(null, file.getUnitName(), source);
       } else {
@@ -89,8 +113,8 @@ public class JavacParser extends Parser {
   public CompilationUnit parse(String mainType, String path, String source) {
     try {
       JavacEnvironment parserEnv = createEnvironment(path, source);
-      JavacTaskImpl task = parserEnv.task();
-      JCTree.JCCompilationUnit unit = (JCTree.JCCompilationUnit) task.parse().iterator().next();
+      JavacTask task = parserEnv.task();
+      CompilationUnitTree unit = task.parse().iterator().next();
       task.analyze();
       processDiagnostics(parserEnv.diagnostics());
       return TreeConverter.convertCompilationUnit(options, parserEnv, unit);
@@ -100,9 +124,9 @@ public class JavacParser extends Parser {
     return null;
   }
 
-  private JavacFileManager getFileManager(JavaCompiler compiler,
+  private StandardJavaFileManager getFileManager(JavaCompiler compiler,
       DiagnosticCollector<JavaFileObject> diagnostics) throws IOException {
-    fileManager = (JavacFileManager)
+    fileManager =
         compiler.getStandardFileManager(diagnostics, null, options.fileUtil().getCharset());
     addPaths(StandardLocation.CLASS_PATH, classpathEntries, fileManager);
     addPaths(StandardLocation.SOURCE_PATH, sourcepathEntries, fileManager);
@@ -118,7 +142,7 @@ public class JavacParser extends Parser {
     return fileManager;
   }
 
-  private void addPaths(Location location, List<String> paths, JavacFileManager fileManager)
+  private void addPaths(Location location, List<String> paths, StandardJavaFileManager fileManager)
       throws IOException {
     List<File> filePaths = new ArrayList<>();
     for (String path : paths) {
@@ -145,11 +169,17 @@ public class JavacParser extends Parser {
     if (lintArgument != null) {
       javacOptions.add(lintArgument);
     }
+    String explicitProcessors = options.getProcessors();
+    if (explicitProcessors != null) {
+      javacOptions.add("-processor");
+      javacOptions.add(explicitProcessors);
+    }
     if (processAnnotations) {
       javacOptions.add("-proc:only");
     } else {
       javacOptions.add("-proc:none");
     }
+    javacOptions.addAll(options.getPlatformModuleSystemOptions());
     return javacOptions;
   }
 
@@ -171,7 +201,7 @@ public class JavacParser extends Parser {
       if (ErrorUtil.errorCount() == 0) {
         for (CompilationUnitTree ast : units) {
           com.google.devtools.j2objc.ast.CompilationUnit unit = TreeConverter
-              .convertCompilationUnit(options, env, (JCTree.JCCompilationUnit) ast);
+              .convertCompilationUnit(options, env, ast);
           processDiagnostics(env.diagnostics());
           handler.handleParsedUnit(unit.getSourceFilePath(), unit);
         }
@@ -181,10 +211,40 @@ public class JavacParser extends Parser {
     }
   }
 
+  /**
+   * To allow Java 9 libraries like GSON to be transpiled using -source 1.8, stub out
+   * the module-info source. This creates an empty .o file, like package-info.java
+   * files without annotations. Skipping the file isn't feasible because of build tool
+   * output file expectations.
+   */
+  private static JavaFileObject filterJavaFileObject(JavaFileObject fobj) {
+    String path = fobj.getName();
+    if (path.endsWith("module-info.java")) {
+      String pkgName = null;
+      try {
+        pkgName = moduleName(fobj.getCharContent(true).toString());
+        String source = "package " + pkgName + ";";
+        return new MemoryFileObject(path, JavaFileObject.Kind.SOURCE, source);
+      } catch (IOException e) {
+        // Fall-through
+      }
+    }
+    return fobj;
+  }
+
+  private static String moduleName(String moduleSource) {
+    Pattern p = Pattern.compile("module\\s+([a-zA_Z_][\\.\\w]*)");
+    Matcher matcher = p.matcher(moduleSource);
+    if (matcher.find()) {
+      return matcher.group(1);
+    }
+    return "";
+  }
+
   // Creates a javac environment from a memory source.
   private JavacEnvironment createEnvironment(String path, String source) throws IOException {
     List<JavaFileObject> inputFiles = new ArrayList<>();
-    inputFiles.add(MemoryFileObject.createJavaFile(path, source));
+    inputFiles.add(filterJavaFileObject(MemoryFileObject.createJavaFile(path, source)));
     return createEnvironment(Collections.emptyList(), inputFiles, false);
   }
 
@@ -193,15 +253,15 @@ public class JavacParser extends Parser {
       boolean processAnnotations) throws IOException {
     JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
     DiagnosticCollector<JavaFileObject> diagnostics = new DiagnosticCollector<>();
-    JavacFileManager fileManager = getFileManager(compiler, diagnostics);
+    StandardJavaFileManager fileManager = getFileManager(compiler, diagnostics);
     List<String> javacOptions = getJavacOptions(processAnnotations);
     if (fileObjects == null) {
       fileObjects = new ArrayList<>();
     }
     for (JavaFileObject jfo : fileManager.getJavaFileObjectsFromFiles(files)) {
-      fileObjects.add(jfo);
+      fileObjects.add(filterJavaFileObject(jfo));
     }
-    JavacTaskImpl task = (JavacTaskImpl) compiler.getTask(null, fileManager, diagnostics,
+    JavacTask task = (JavacTask) compiler.getTask(null, fileManager, diagnostics,
         javacOptions, null, fileObjects);
     return new JavacEnvironment(task, fileManager, diagnostics);
   }
@@ -217,10 +277,11 @@ public class JavacParser extends Parser {
     String path = file.getUnitName();
     try {
       JavacEnvironment parserEnv = createEnvironment(path, source);
-      JavacTaskImpl task = parserEnv.task();
-      JCTree.JCCompilationUnit unit = (JCTree.JCCompilationUnit) task.parse().iterator().next();
+      JavacTask task = parserEnv.task();
+      CompilationUnitTree unit = task.parse().iterator().next();
       processDiagnostics(parserEnv.diagnostics());
-      return new JavacParseResult(file, source, unit);
+      return new JavacParseResult(
+          file, source, unit, parserEnv.treeUtilities().getSourcePositions());
     } catch (IOException e) {
       ErrorUtil.fatalError(e, path);
     }
@@ -235,7 +296,7 @@ public class JavacParser extends Parser {
     PathClassLoader loader = new PathClassLoader(options.fileUtil().getClassPathEntries());
     loader.addPaths(options.getProcessorPathEntries());
     Iterator<Processor> serviceIterator = ServiceLoader.load(Processor.class, loader).iterator();
-    if (serviceIterator.hasNext()) {
+    if (serviceIterator.hasNext() || options.getProcessors() != null) {
       List<File> inputFiles = new ArrayList<>();
       for (ProcessingContext input : inputs) {
         inputFiles.add(new File(input.getFile().getAbsolutePath()));
@@ -243,9 +304,7 @@ public class JavacParser extends Parser {
       try {
         JavacEnvironment env = createEnvironment(inputFiles, null, true);
         env.task().parse();
-        // JavacTaskImpl.enter() parses and runs annotation processing, but
-        // not type checking and attribution (that's done by analyze()).
-        env.task().enter();
+        env.task().analyze();
         processDiagnostics(env.diagnostics());
         // The source output directory is created and set in createEnvironment().
         File sourceOutputDirectory =
@@ -327,17 +386,23 @@ public class JavacParser extends Parser {
   private static class JavacParseResult implements Parser.ParseResult {
     private final InputFile file;
     private String source;
-    private final JCTree.JCCompilationUnit unit;
+    private final CompilationUnitTree unit;
+    private final SourcePositions sourcePositions;
 
-    private JavacParseResult(InputFile file, String source, JCTree.JCCompilationUnit unit) {
+    private JavacParseResult(
+        InputFile file,
+        String source,
+        CompilationUnitTree unit,
+        SourcePositions sourcePositions) {
       this.file = file;
       this.source = source;
       this.unit = unit;
+      this.sourcePositions = sourcePositions;
     }
 
     @Override
     public void stripIncompatibleSource() {
-      source = JavacJ2ObjCIncompatibleStripper.strip(source, unit);
+      source = JavacJ2ObjCIncompatibleStripper.strip(source, unit, sourcePositions);
     }
 
     @Override

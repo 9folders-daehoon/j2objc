@@ -1604,4 +1604,39 @@ public class StatementGeneratorTest extends GenerationTest {
     assertTranslation(translation, "if (a < b) ;");
     assertTranslatedLines(translation, "if (c < d)", ";");
   }
+
+  public void testVarLocalVariables() throws IOException {
+    if (!onJava10OrAbove()) {
+      return;
+    }
+    String translation = translateSourceFile(String.join("\n",
+        "import java.util.ArrayList;",
+        "import java.util.stream.Stream;",
+        "class Test {",
+        "  Stream test() {",
+        "    var list = new ArrayList<String>();",
+        "    var stream = list.stream();",
+        "    return stream;",
+        "  }",
+        "}"), "Test", "Test.m");
+    // Verify correct type inference.
+    assertTranslation(translation, "JavaUtilArrayList *list = create_JavaUtilArrayList_init();");
+    assertTranslation(translation, "id<JavaUtilStreamStream> stream = [list stream];");
+  }
+
+  public void testVarLambdaExpressionParameter() throws IOException {
+    if (!onJava11OrAbove()) {
+      return;
+    }
+    String translation = translateSourceFile(String.join("\n",
+        "import java.util.function.Function;",
+        "class Test {",
+        "  int test(String input) {",
+        "    Function<String, Integer> f = (var s) -> s.length();",
+        "    return f.apply(input);",
+        "  }",
+        "}"), "Test", "Test.m");
+    assertTranslation(translation,
+        "@interface Test_$Lambda$1 : NSObject < JavaUtilFunctionFunction >");
+  }
 }

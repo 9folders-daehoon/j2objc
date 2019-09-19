@@ -1342,4 +1342,12 @@ public class CompatibilityTest extends ProtobufTest {
     TypicalData data = TypicalData.parseFrom(new ByteArrayInputStream(rawData));
     assertEquals("abc\ufffd\ufffd\ufffd\ufffddef", data.getMyString());
   }
+
+  public void testDescriptorGetName() throws Exception {
+    Descriptor descriptor = TypicalData.Builder.getDescriptor();
+    // Java returns TypicalData.
+    // The transpiled code returns ProtosTypicalData because it does not have
+    // reflection metadata (i.e. defaults to NSStringFromClass).
+    assertTrue(descriptor.getName().endsWith("TypicalData"));
+  }
 }

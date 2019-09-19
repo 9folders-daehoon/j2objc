@@ -9,8 +9,6 @@ package jsr166;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
-import com.google.j2objc.util.ReflectionUtil;
-
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -19,6 +17,7 @@ import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.Queue;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ExecutorService;
@@ -653,10 +652,6 @@ public class LinkedTransferQueueTest extends JSR166TestCase {
      * A deserialized serialized queue has same elements in same order
      */
     public void testSerialization() throws Exception {
-        // J2ObjC reflection-stripping change.
-        if (ReflectionUtil.isJreReflectionStripped()) {
-            return;
-        }
         Queue x = populatedQueue(SIZE);
         Queue y = serialClone(x);
 
@@ -756,9 +751,11 @@ public class LinkedTransferQueueTest extends JSR166TestCase {
             }});
 
         threadStarted.await();
-        waitForThreadToEnterWaitState(t);
-        assertEquals(1, q.getWaitingConsumerCount());
-        assertTrue(q.hasWaitingConsumer());
+        Callable<Boolean> oneConsumer
+            = new Callable<Boolean>() { public Boolean call() {
+                return q.hasWaitingConsumer()
+                && q.getWaitingConsumerCount() == 1; }};
+        waitForThreadToEnterWaitState(t, oneConsumer);
 
         assertTrue(q.offer(one));
         assertEquals(0, q.getWaitingConsumerCount());
@@ -795,8 +792,11 @@ public class LinkedTransferQueueTest extends JSR166TestCase {
             }});
 
         threadStarted.await();
-        waitForThreadToEnterWaitState(t);
-        assertEquals(1, q.size());
+        Callable<Boolean> oneElement
+            = new Callable<Boolean>() { public Boolean call() {
+                return !q.isEmpty() && q.size() == 1; }};
+        waitForThreadToEnterWaitState(t, oneElement);
+
         assertSame(five, q.poll());
         checkEmpty(q);
         awaitTermination(t);

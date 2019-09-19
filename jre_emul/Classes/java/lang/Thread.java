@@ -17,7 +17,6 @@
 
 package java.lang;
 
-import com.google.j2objc.annotations.ReflectionSupport;
 import com.google.j2objc.annotations.Weak;
 
 import java.util.ArrayList;
@@ -54,7 +53,6 @@ import sun.nio.ch.Interruptible;
  *
  * @author Tom Ball, Keith Stanger
  */
-@ReflectionSupport(value = ReflectionSupport.Level.FULL)
 public class Thread implements Runnable {
   private static final int NANOS_PER_MILLI = 1000000;
 
@@ -416,11 +414,11 @@ public class Thread implements Runnable {
       throw new IllegalThreadStateException("This thread was already started!");
     }
     threadGroup.add(this);
+    state = STATE_RUNNABLE;
     start0();
     if (priority != NORM_PRIORITY) {
       nativeSetPriority(priority);
     }
-    state = STATE_RUNNABLE;
   }
 
   private native void start0() /*-[

@@ -244,7 +244,7 @@ public class MetadataWriter extends UnitTreeVisitor {
       String methodName = ElementUtil.getName(method);
       String selector = nameTable.getMethodSelector(method);
       boolean isConstructor = ElementUtil.isConstructor(method);
-      if (selector.equals(methodName) || isConstructor) {
+      if (selector.equals(methodName) || isConstructor || translationUtil.isJUnit3TestClass(type)) {
         methodName = null;  // Reduce redundant data.
       }
 
@@ -474,10 +474,7 @@ public class MetadataWriter extends UnitTreeVisitor {
       modifiers |= ElementUtil.ACC_ENUM;
     }
     if (ElementUtil.isAnonymous(type)) {
-      // Anonymous classes are always static, though their closure may include an instance.
-      modifiers |= ElementUtil.ACC_ANONYMOUS | java.lang.reflect.Modifier.STATIC;
-      // Anonymous classes are always implicitly final (JLS 15.9.5.).
-      modifiers |= java.lang.reflect.Modifier.FINAL;
+      modifiers |= ElementUtil.ACC_ANONYMOUS;
     }
     return modifiers;
   }

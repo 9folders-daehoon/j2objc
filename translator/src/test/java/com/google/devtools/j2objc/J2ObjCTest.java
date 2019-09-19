@@ -14,7 +14,11 @@
 
 package com.google.devtools.j2objc;
 
+import com.google.devtools.j2objc.util.FileUtil;
 import com.google.devtools.j2objc.util.HeaderMap;
+import com.google.devtools.j2objc.util.SourceVersion;
+import com.google.devtools.j2objc.util.Version;
+import java.io.File;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collections;
@@ -195,15 +199,7 @@ public class J2ObjCTest extends GenerationTest {
     makeAssertionsForJavaFiles(exampleH, exampleM, packageInfoH, packageInfoM);
   }
 
-  // Test a simple annotation processor on the classpath.
-  public void testAnnotationProcessing() throws Exception {
-    String processorPath = getResourceAsFile("annotations/Processor.jar");
-    options.fileUtil().getClassPathEntries().add(processorPath);
-
-    String examplePath = addSourceFile(EXAMPLE_JAVA_SOURCE, "annotations/Example.java");
-    J2ObjC.run(Collections.singletonList(examplePath), options);
-    assertErrorCount(0);
-
+  private void assertServiceAnnotationProcessorOutput() throws IOException {
     String translatedAnnotationHeader = getTranslatedFile("ProcessingResult.h");
     String translatedAnnotationImpl = getTranslatedFile("ProcessingResult.m");
 
@@ -215,6 +211,30 @@ public class J2ObjCTest extends GenerationTest {
     assertTranslation(translatedAnnotationImpl, "return @\"ObjectiveCName\"");
   }
 
+  private void assertSpecifiedAnnotationProcessorOutput() throws IOException {
+    String translatedAnnotationHeader = getTranslatedFile("ExplicitProcessingResult.h");
+    String translatedAnnotationImpl = getTranslatedFile("ExplicitProcessingResult.m");
+
+    // Our dummy annotation processor is very simple--it always creates a class with no package,
+    // ProcessingResult, with a minimal implementation.
+    assertTranslation(translatedAnnotationHeader, "@interface ExplicitProcessingResult : NSObject");
+    assertTranslation(translatedAnnotationHeader, "- (NSString *)getResultForExplicitProcessor;");
+    assertTranslation(translatedAnnotationImpl, "@implementation ExplicitProcessingResult");
+    assertTranslation(translatedAnnotationImpl, "return @\"ObjectiveCName\"");
+  }
+
+  // Test a simple annotation processor on the classpath.
+  public void testAnnotationProcessing() throws Exception {
+    String processorPath = getResourceAsFile("annotations/Processor.jar");
+    options.fileUtil().getClassPathEntries().add(processorPath);
+
+    String examplePath = addSourceFile(EXAMPLE_JAVA_SOURCE, "annotations/Example.java");
+    J2ObjC.run(Collections.singletonList(examplePath), options);
+    assertErrorCount(0);
+
+    assertServiceAnnotationProcessorOutput();
+  }
+
   // Test a simple annotation processor on the processor path.
   public void testAnnotationProcessingWithProcessorPath() throws Exception {
     String processorPath = getResourceAsFile("annotations/Processor.jar");
@@ -223,17 +243,52 @@ public class J2ObjCTest extends GenerationTest {
     String examplePath = addSourceFile(EXAMPLE_JAVA_SOURCE, "annotations/Example.java");
     J2ObjC.run(Collections.singletonList(examplePath), options);
     assertErrorCount(0);
+
+    assertServiceAnnotationProcessorOutput();
   }
 
   // Test a specified annotation processor.
   public void testSpecifiedAnnotationProcessing() throws Exception {
-    String processorPath = getResourceAsFile("annotations/Processor.jar");
+    String processorPath = getResourceAsFile("annotations/ExplicitProcessor.jar");
     options.fileUtil().getClassPathEntries().add(processorPath);
-    options.setProcessors("com.google.devtools.j2objc.annotations.J2ObjCTestProcessor");
+    options.setProcessors("com.google.devtools.j2objc.annotations.J2ObjCTestExplicitProcessor");
 
     String examplePath = addSourceFile(EXAMPLE_JAVA_SOURCE, "annotations/Example.java");
     J2ObjC.run(Collections.singletonList(examplePath), options);
     assertErrorCount(0);
+
+    assertSpecifiedAnnotationProcessorOutput();
+  }
+
+  // Test an explicitly invoked annotation processor on the processor path.
+  public void testSpecifiedAnnotationProcessingWithProcessorPath() throws Exception {
+    String processorPath = getResourceAsFile("annotations/ExplicitProcessor.jar");
+    options.getProcessorPathEntries().add(processorPath);
+    options.setProcessors("com.google.devtools.j2objc.annotations.J2ObjCTestExplicitProcessor");
+
+    String examplePath = addSourceFile(EXAMPLE_JAVA_SOURCE, "annotations/Example.java");
+    J2ObjC.run(Collections.singletonList(examplePath), options);
+    assertErrorCount(0);
+
+    assertSpecifiedAnnotationProcessorOutput();
+  }
+
+  // Test both types of processor detection at the same time, see that -processor indeed bypasses
+  // default discovery
+  public void testSpecifiedAnnotationProcessingBypass() throws Exception {
+    String serviceProcessorPath = getResourceAsFile("annotations/Processor.jar");
+    String explicitProcessorPath = getResourceAsFile("annotations/ExplicitProcessor.jar");
+    options.fileUtil().getClassPathEntries().add(serviceProcessorPath);
+    options.fileUtil().getClassPathEntries().add(explicitProcessorPath);
+    options.setProcessors("com.google.devtools.j2objc.annotations.J2ObjCTestExplicitProcessor");
+
+    String examplePath = addSourceFile(EXAMPLE_JAVA_SOURCE, "annotations/Example.java");
+    J2ObjC.run(Collections.singletonList(examplePath), options);
+    assertErrorCount(0);
+
+    assertSpecifiedAnnotationProcessorOutput();
+    assertFalse("Overridden processor generated output",
+        getTempFile("ProcessingResult.h").exists());
   }
 
   // Test for warning if compiling jar with -g.
@@ -267,5 +322,41 @@ public class J2ObjCTest extends GenerationTest {
 
     // ... and that there isn't a "type not found" import.
     assertNotInTranslation(translation, "Example.h");
+  }
+
+  // Verify module-info.java files generate no-code output files with "-source 1.8" flag.
+  public void testSource8EmptyModuleInfo() throws IOException {
+    options.setSourceVersion(SourceVersion.JAVA_8);
+    String srcPath = addSourceFile(
+        "module foo.bar {"
+        + "  exports foo.bar;"
+        + "}",
+        "foo.bar/module-info.java");
+    J2ObjC.run(Collections.singletonList(srcPath), options);
+    String translation = getTranslatedFile("foo/bar/module-info.h");
+    assertTranslation(translation, "INCLUDE_ALL_FooBarModule_info");
+    translation = getTranslatedFile("foo/bar/module-info.m");
+    assertTranslation(translation, "foo/bar/module-info.h");
+    assertNotInTranslation(translation, "@implementation");
+  }
+
+  public void testHeaderOutputDirectory() throws IOException {
+    File headerOutputDir = FileUtil.createTempDir("testout-hdrs");
+    options.fileUtil().setHeaderOutputDirectory(headerOutputDir);
+    String srcPath = addSourceFile("package foo.bar; class Test {}", "foo/bar/Test.java");
+    J2ObjC.run(Collections.singletonList(srcPath), options);
+
+    // Just the generated header should be in the header output directory.
+    assertTrue(new File(headerOutputDir, "foo/bar/Test.h").exists());
+    assertFalse(new File(headerOutputDir, "foo/bar/Test.m").exists());
+
+    // Everything else is still in the regular output directory.
+    assertFalse(new File(tempDir, "foo/bar/Test.h").exists());
+    assertTrue(new File(tempDir, "foo/bar/Test.m").exists());
+    assertTrue(new File(tempDir, "foo/bar/Test.java").exists());
+  }
+
+  public void testJavacVersionString() {
+    assertTrue(Version.jarVersion(Options.class).contains("(javac "));
   }
 }

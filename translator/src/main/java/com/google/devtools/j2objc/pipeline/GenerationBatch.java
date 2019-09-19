@@ -83,11 +83,8 @@ public class GenerationBatch {
       inputFile = new RegularInputFile(filename, filename);
 
       if (!inputFile.exists()) {
-        // Convert to a qualified name and search on the sourcepath.
-        String qualifiedName =
-            filename.substring(0, filename.length() - 5).replace(File.separatorChar, '.');
-        inputFile = options.fileUtil().findOnSourcePath(qualifiedName);
-
+        // Check source path for regular file.
+        inputFile = options.fileUtil().findFileOnSourcePath(filename);
         if (inputFile == null) {
           ErrorUtil.error("No such file: " + filename);
           return;

@@ -44,6 +44,7 @@ import com.google.devtools.j2objc.util.ErrorUtil;
 import com.google.devtools.j2objc.util.FileUtil;
 import com.google.devtools.j2objc.util.NameTable;
 import com.google.devtools.j2objc.util.Parser;
+import com.google.devtools.j2objc.util.SourceVersion;
 import com.google.devtools.j2objc.util.TimeTracker;
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
@@ -63,6 +64,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
+import java.util.Optional;
 import java.util.jar.JarEntry;
 import java.util.jar.JarOutputStream;
 import java.util.regex.Matcher;
@@ -96,6 +98,9 @@ public class GenerationTest extends TestCase {
   @Override
   protected void setUp() throws IOException {
     tempDir = FileUtil.createTempDir("testout");
+    if (onJava9OrAbove()) {
+      SourceVersion.setMaxSupportedVersion(SourceVersion.JAVA_11);
+    }
     loadOptions();
     createParser();
   }
@@ -554,6 +559,31 @@ public class GenerationTest extends TestCase {
   }
 
   /**
+   * Similar to the versions above, but it does not generate an in-memory file.
+   *
+   * @param inputFile the name of the file to be transpiled
+   * @param outputFile the name of the file whose contents should be returned,
+   *                   which is either the Obj-C header or implementation file
+   */
+  protected String translateSourceFileNoInMemory(String inputFile, String outputFile)
+      throws IOException {
+    Parser.Handler handler = (String path, CompilationUnit newUnit) -> {
+      try {
+        TranslationProcessor.applyMutations(
+            newUnit, deadCodeMap, options.externalAnnotations(), TimeTracker.noop());
+        generateFromUnit(newUnit, outputFile);
+      } catch (IOException e) {
+        // Ignore.
+      }
+    };
+    parser.parseFiles(Arrays.asList(inputFile), handler, null);
+    if (ErrorUtil.errorCount() > 0) {
+      failWithMessages("Compilation errors:", ErrorUtil.getErrorMessages());
+    }
+    return getTranslatedFile(outputFile);
+  }
+
+  /**
    * Compile Java source and translate the resulting class file, returning the
    * contents of either the generated header or implementation file.
    *
@@ -732,6 +762,25 @@ public class GenerationTest extends TestCase {
   protected boolean onJava9OrAbove() {
     try {
       Class.forName("java.lang.Module");
+      return true;
+    } catch (ClassNotFoundException e) {
+      return false;
+    }
+  }
+
+  protected boolean onJava10OrAbove() {
+    try {
+      // orElseThrow(Supplier) is in Java 8, orElseThrow() is new to Java 10.
+      Optional.class.getMethod("orElseThrow");
+      return true;
+    } catch (NoSuchMethodException e) {
+      return false;
+    }
+  }
+
+  protected boolean onJava11OrAbove() {
+    try {
+      Class.forName("java.net.http.HttpClient");
       return true;
     } catch (ClassNotFoundException e) {
       return false;

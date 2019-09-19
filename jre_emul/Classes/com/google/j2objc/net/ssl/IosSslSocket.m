@@ -20,8 +20,10 @@
 #import "java/io/OutputStream.h"
 #import "java/lang/Exception.h"
 #import "java/lang/IllegalArgumentException.h"
+#import "java/lang/NullPointerException.h"
 #import "java/lang/UnsupportedOperationException.h"
 #import "java/net/InetAddress.h"
+#import "java/net/Socket.h"
 #import "java/net/SocketException.h"
 #import "java/io/IOException.h"
 #import "jni_util.h"
@@ -56,6 +58,7 @@ static NSDictionary *protocolMapping;
 }
 - (JavaIoInputStream *)plainInputStream;
 - (JavaIoOutputStream *)plainOutputStream;
+- (NSString *)getHostname;
 @end
 
 // An input stream that uses Apple's SSLRead.
@@ -81,16 +84,18 @@ static NSDictionary *protocolMapping;
   OSStatus status;
 
   [_socket startHandshake];
+
+  // Deplete the SSL buffer before issuing a new read.
+  size_t available = 0;
+  checkStatus(SSLGetBufferedReadSize(_socket->_sslContext, &available));
+  if (available != 0) {
+    len = MIN(((jint) available), len);
+  }
+
   @synchronized (_socket) {
     do {
-      size_t temp;
-      status = SSLRead(_socket->_sslContext, b->buffer_ + off, len, &temp);
-      off += temp;
-      len -= temp;
-      processed += temp;
-      // if less data than requested was actually transferred then, keep calling SSLRead until
-      // something different from errSSLWouldBlock is returned.
-    } while (status == errSSLWouldBlock);
+      status = SSLRead(_socket->_sslContext, b->buffer_ + off, len, &processed);
+    } while (status == errSSLWouldBlock && processed == 0);
   }
 
   if (status == errSSLClosedGraceful || status == errSSLClosedAbort) {
@@ -183,6 +188,9 @@ static NSDictionary *protocolMapping;
 @implementation ComGoogleJ2objcNetSslIosSslSocket
 
 + (void)initialize {
+  if (self != [ComGoogleJ2objcNetSslIosSslSocket class]) {
+    return;
+  }
   NSMutableDictionary *temp = [[[NSMutableDictionary alloc] init] autorelease];
   NSString *key;
   key = [ComGoogleJ2objcSecurityIosSecurityProvider_SslProtocol_get_DEFAULT() description];
@@ -206,6 +214,10 @@ static NSDictionary *protocolMapping;
   return [super getOutputStream];
 }
 
+- (NSString *)getHostname {
+  return [[self getInetAddress] getHostName];
+}
+
 - (void)dealloc {
   tearDownContext(self);
   [_sslInputStream release];
@@ -218,9 +230,10 @@ static NSDictionary *protocolMapping;
 
 - (void)close {
   @synchronized(self) {
-    if ([self isClosed]) return;
     tearDownContext(self);
-    [super close];
+    if (![self isClosed]) {
+      [super close];
+    }
   }
 }
 
@@ -330,42 +343,46 @@ static NSDictionary *protocolMapping;
 @end
 
 static OSStatus SslReadCallback(SSLConnectionRef connection, void *data, size_t *dataLength) {
-  ComGoogleJ2objcNetSslIosSslSocket *socket = (ComGoogleJ2objcNetSslIosSslSocket *) connection;
-  IOSByteArray *array = [IOSByteArray arrayWithLength:*dataLength];
-  jint processed;
-  @try {
-    processed = [[socket plainInputStream] readWithByteArray:array];
-  } @catch (JavaIoIOException *e) {
-    JreStrongAssign(&socket->_sslException, e);
-    return errSSLInternal;
-  }
+  @autoreleasepool {
+    ComGoogleJ2objcNetSslIosSslSocket *socket = (ComGoogleJ2objcNetSslIosSslSocket *) connection;
+    IOSByteArray *array = [IOSByteArray arrayWithLength:*dataLength];
+    jint processed;
+    @try {
+      processed = [[socket plainInputStream] readWithByteArray:array];
+    } @catch (JavaIoIOException *e) {
+      JreStrongAssign(&socket->_sslException, e);
+      return errSSLInternal;
+    }
 
-  if (processed  < 0) {
-    *dataLength = 0;
-    return errSSLClosedGraceful;
-  }
+    if (processed  < 0) {
+      *dataLength = 0;
+      return errSSLClosedGraceful;
+    }
 
-  OSStatus status = processed < *dataLength ? errSSLWouldBlock : errSecSuccess;
-  if (processed > 0) {
-    [array getBytes:(jbyte *)data length:processed];
+    OSStatus status = processed < *dataLength ? errSSLWouldBlock : errSecSuccess;
+    if (processed > 0) {
+      [array getBytes:(jbyte *)data length:processed];
+    }
+    *dataLength = processed;
+    return status;
   }
-  *dataLength = processed;
-  return status;
 }
 
 static OSStatus SslWriteCallback(SSLConnectionRef connection,
                                  const void *data,
                                  size_t *dataLength) {
-  ComGoogleJ2objcNetSslIosSslSocket *socket = (ComGoogleJ2objcNetSslIosSslSocket *) connection;
-  IOSByteArray *array = [IOSByteArray arrayWithBytes:(const jbyte *)data count:*dataLength];
-  @try {
-    [[socket plainOutputStream] writeWithByteArray:array];
-    [[socket plainOutputStream] flush];
-  } @catch (JavaIoIOException *e) {
-    JreStrongAssign(&socket->_sslException, e);
-    return errSSLInternal;
+  @autoreleasepool {
+    ComGoogleJ2objcNetSslIosSslSocket *socket = (ComGoogleJ2objcNetSslIosSslSocket *) connection;
+    IOSByteArray *array = [IOSByteArray arrayWithBytes:(const jbyte *)data count:*dataLength];
+    @try {
+      [[socket plainOutputStream] writeWithByteArray:array];
+      [[socket plainOutputStream] flush];
+    } @catch (JavaIoIOException *e) {
+      JreStrongAssign(&socket->_sslException, e);
+      return errSSLInternal;
+    }
+    return errSecSuccess;
   }
-  return errSecSuccess;
 }
 
 static void checkStatus(OSStatus status) {
@@ -385,7 +402,7 @@ static void setUpContext(ComGoogleJ2objcNetSslIosSslSocket *self) {
   self->_sslContext = SSLCreateContext(nil, kSSLClientSide, kSSLStreamType);
   checkStatus(SSLSetIOFuncs(self->_sslContext, SslReadCallback, SslWriteCallback));
   checkStatus(SSLSetConnection(self->_sslContext, self));
-  NSString *hostName = [[self getInetAddress] getHostName];
+  NSString *hostName = [self getHostname];
   checkStatus(SSLSetPeerDomainName(self->_sslContext, [hostName UTF8String], [hostName length]));
   SSLProtocol protocol = [protocolMapping[[self->enabledProtocols objectAtIndex:0]] intValue];
   checkStatus(SSLSetProtocolVersionMin(self->_sslContext, protocol));
@@ -393,7 +410,7 @@ static void setUpContext(ComGoogleJ2objcNetSslIosSslSocket *self) {
 
 static void tearDownContext(ComGoogleJ2objcNetSslIosSslSocket *self) {
   if (self->_sslContext) {
-    checkStatus(SSLClose(self->_sslContext));
+    SSLClose(self->_sslContext);
     CFRelease(self->_sslContext);
     self->_sslContext = nil;
   }
@@ -500,6 +517,266 @@ ComGoogleJ2objcNetSslIosSslSocket *create_ComGoogleJ2objcNetSslIosSslSocket_init
   J2OBJC_CREATE_IMPL(ComGoogleJ2objcNetSslIosSslSocket,
                      initWithJavaNetInetAddress_withInt_withJavaNetInetAddress_withInt_, address,
                      port, localAddr, localPort)
+}
+
+// Delegates most of the calls to the underlying socket.
+@interface WrapperSocket : ComGoogleJ2objcNetSslIosSslSocket {
+@public
+  JavaNetSocket *underlyingSocket;
+  NSString *hostname;
+  BOOL autoClose;
+}
+@end
+
+@implementation WrapperSocket
+
+- (void)dealloc {
+  [super dealloc];
+  [underlyingSocket release];
+  [hostname release];
+}
+
+#pragma mark ComGoogleJ2objcNetSslIosSslSocket methods
+
+- (void)close {
+  @synchronized(self) {
+    tearDownContext(self);
+    if (autoClose && ![underlyingSocket isClosed]) {
+      [underlyingSocket close];
+    }
+  }
+}
+
+- (JavaIoInputStream *)plainInputStream {
+  return [underlyingSocket getInputStream];
+}
+
+- (JavaIoOutputStream *)plainOutputStream {
+  return [underlyingSocket getOutputStream];
+}
+
+- (NSString *)getHostname {
+  return hostname;
+}
+
+#pragma mark JavaNetSocket methods
+
+- (void)bindWithJavaNetSocketAddress:(JavaNetSocketAddress *)bindpoint {
+  [underlyingSocket bindWithJavaNetSocketAddress:bindpoint];
+}
+
+- (void)connectWithJavaNetSocketAddress:(JavaNetSocketAddress *)endpoint {
+  [underlyingSocket connectWithJavaNetSocketAddress:endpoint];
+}
+
+- (void)connectWithJavaNetSocketAddress:(JavaNetSocketAddress *)endpoint
+                                withInt:(jint)timeout {
+  [underlyingSocket connectWithJavaNetSocketAddress:endpoint withInt:timeout];
+}
+
+- (JavaNioChannelsSocketChannel *)getChannel {
+  return [underlyingSocket getChannel];
+}
+
+- (JavaIoFileDescriptor *)getFileDescriptor$ {
+  return [underlyingSocket getFileDescriptor$];
+}
+
+- (JavaNetInetAddress *)getInetAddress {
+  return [underlyingSocket getInetAddress];
+}
+
+- (jboolean)getKeepAlive {
+  return [underlyingSocket getKeepAlive];
+}
+
+- (JavaNetInetAddress *)getLocalAddress {
+  return [underlyingSocket getLocalAddress];
+}
+
+- (jint)getLocalPort {
+  return [underlyingSocket getLocalPort];
+}
+
+- (JavaNetSocketAddress *)getLocalSocketAddress {
+  return [underlyingSocket getLocalSocketAddress];
+}
+
+- (jboolean)getOOBInline {
+  return [underlyingSocket getOOBInline];
+}
+
+- (jint)getPort {
+  return [underlyingSocket getPort];
+}
+
+- (jint)getReceiveBufferSize {
+  return [underlyingSocket getReceiveBufferSize];
+}
+
+- (JavaNetSocketAddress *)getRemoteSocketAddress {
+  return [underlyingSocket getRemoteSocketAddress];
+}
+
+- (jboolean)getReuseAddress {
+  return [underlyingSocket getReuseAddress];
+}
+
+- (jint)getSendBufferSize {
+  return [underlyingSocket getSendBufferSize];
+}
+
+- (jint)getSoLinger {
+  return [underlyingSocket getSoLinger];
+}
+
+- (jint)getSoTimeout {
+  return [underlyingSocket getSoTimeout];
+}
+
+- (jboolean)getTcpNoDelay {
+  return [underlyingSocket getTcpNoDelay];
+}
+
+- (jint)getTrafficClass {
+  return [underlyingSocket getTrafficClass];
+}
+
+- (jboolean)isBound {
+  return [underlyingSocket isBound];
+}
+
+- (jboolean)isClosed {
+  return [underlyingSocket isClosed];
+}
+
+- (jboolean)isConnected {
+  return [underlyingSocket isConnected];
+}
+
+- (jboolean)isInputShutdown {
+  return [underlyingSocket isInputShutdown];
+}
+
+- (jboolean)isOutputShutdown {
+  return [underlyingSocket isOutputShutdown];
+}
+
+- (void)sendUrgentDataWithInt:(jint)data {
+  [underlyingSocket sendUrgentDataWithInt:data];
+}
+
+- (void)setKeepAliveWithBoolean:(jboolean)on {
+  [underlyingSocket setKeepAliveWithBoolean:on];
+}
+
+- (void)setOOBInlineWithBoolean:(jboolean)on {
+  [underlyingSocket setOOBInlineWithBoolean:on];
+}
+
+- (void)setPerformancePreferencesWithInt:(jint)connectionTime
+                                 withInt:(jint)latency
+                                 withInt:(jint)bandwidth {
+  [underlyingSocket setPerformancePreferencesWithInt:connectionTime
+                                             withInt:latency
+                                             withInt:bandwidth];
+}
+
+- (void)setReceiveBufferSizeWithInt:(jint)size {
+  [underlyingSocket setReceiveBufferSizeWithInt:size];
+}
+
+- (void)setReuseAddressWithBoolean:(jboolean)on {
+  [underlyingSocket setReuseAddressWithBoolean:on];
+}
+
+- (void)setSendBufferSizeWithInt:(jint)size {
+  [underlyingSocket setSendBufferSizeWithInt:size];
+}
+
+- (void)setSoLingerWithBoolean:(jboolean)on
+                       withInt:(jint)linger {
+  [underlyingSocket setSoLingerWithBoolean:on withInt:linger];
+}
+
+- (void)setSoTimeoutWithInt:(jint)timeout {
+  [underlyingSocket setSoTimeoutWithInt:timeout];
+}
+
+- (void)setTcpNoDelayWithBoolean:(jboolean)on {
+  [underlyingSocket setTcpNoDelayWithBoolean:on];
+}
+
+- (void)setTrafficClassWithInt:(jint)tc {
+  [underlyingSocket setTrafficClassWithInt:tc];
+}
+
+- (void)shutdownInput {
+  [underlyingSocket shutdownInput];
+}
+
+- (void)shutdownOutput {
+  [underlyingSocket shutdownOutput];
+}
+
+- (NSString *)description {
+  return [underlyingSocket description];
+}
+
+- (void)createImplWithBoolean:(jboolean)stream {
+  [underlyingSocket createImplWithBoolean:stream];
+}
+
+- (JavaNetSocketImpl *)getImpl {
+  return [underlyingSocket getImpl];
+}
+
+- (void)postAccept {
+  [underlyingSocket postAccept];
+}
+
+- (void)setBound {
+  [underlyingSocket setBound];
+}
+
+- (void)setConnected {
+  [underlyingSocket setConnected];
+}
+
+- (void)setCreated {
+  [underlyingSocket setCreated];
+}
+
+- (void)setImpl {
+  [underlyingSocket setImpl];
+}
+
+@end
+
+// public IosSslSocket(Socket s, String host, int port, boolean autoClose)
+void WrapperSocket_initWithJavaNetSocket_initWithNSString_withInt_withBoolean_(
+    WrapperSocket *self, JavaNetSocket *socket, NSString *host, jint port, jboolean autoClose) {
+  if (![nil_chk(socket) isConnected]) {
+    J2ObjCThrowByName(JavaNetSocketException, @"socket is not connected.");
+  }
+  init(self);
+  JreStrongAssign(&self->underlyingSocket, socket);
+  JreStrongAssign(&self->hostname, host);
+  self->autoClose = autoClose;
+}
+
+ComGoogleJ2objcNetSslIosSslSocket *
+new_ComGoogleJ2objcNetSslIosSslSocket_initWithJavaNetSocket_withNSString_withInt_withBoolean_(
+    JavaNetSocket *socket, NSString *host, jint port, jboolean autoClose) {
+  J2OBJC_NEW_IMPL(WrapperSocket, initWithJavaNetSocket_initWithNSString_withInt_withBoolean_,
+                  socket, host, port, autoClose)
+}
+
+ComGoogleJ2objcNetSslIosSslSocket *
+create_ComGoogleJ2objcNetSslIosSslSocket_initWithJavaNetSocket_withNSString_withInt_withBoolean_(
+    JavaNetSocket *socket, NSString *host, jint port, jboolean autoClose) {
+  J2OBJC_CREATE_IMPL(WrapperSocket, initWithJavaNetSocket_initWithNSString_withInt_withBoolean_,
+                     socket, host, port, autoClose)
 }
 
 J2OBJC_CLASS_TYPE_LITERAL_SOURCE(ComGoogleJ2objcNetSslIosSslSocket)
