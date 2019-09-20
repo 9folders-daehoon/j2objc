@@ -25,6 +25,7 @@ import com.google.devtools.j2objc.util.FileUtil;
 import java.io.File;
 import java.io.IOException;
 import java.util.Enumeration;
+import java.util.HashMap;
 import java.util.List;
 import java.util.logging.Logger;
 import java.util.zip.ZipEntry;
@@ -103,6 +104,7 @@ public class GenerationBatch {
     if (f.exists() && f.isFile()) {
       return f;
     }
+    
     // Checking the sourcepath is helpful for our unit tests where the source
     // jars aren't relative to the current working directory.
     for (String path : options.fileUtil().getSourcePathEntries()) {
@@ -117,6 +119,8 @@ public class GenerationBatch {
     return null;
   }
 
+  static HashMap<File, File> gInflatedJars = new HashMap<>();
+  
   private void processJarFile(String filename) {
     File f = findJarFile(filename);
     if (f == null) {
@@ -124,6 +128,12 @@ public class GenerationBatch {
       return;
     }
 
+    if (gInflatedJars.get(f) != null) {
+    	return;
+    }
+
+    gInflatedJars.put(f, f);
+    
     // Warn if source debugging is specified for a jar file, since native debuggers
     // don't support Java-like source paths.
     if (options.emitLineDirectives()) {
