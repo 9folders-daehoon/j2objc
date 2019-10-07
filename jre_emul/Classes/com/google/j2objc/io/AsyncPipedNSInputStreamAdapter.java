@@ -123,7 +123,7 @@ public final class AsyncPipedNSInputStreamAdapter {
 
       // If the stream buffer cannot accommodate this chunk, we need to extract the leftover.
       if (written < len) {
-        leftoverData_ = [[NSData alloc] initWithBytes:(ptr + written) length:(len - written)];
+        JreGenericFieldAssign(&leftoverData_, [[NSData alloc] initWithBytes:(ptr + written) length:(len - written)]);
       }
     ]-*/;
 

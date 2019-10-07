@@ -407,6 +407,7 @@ FOUNDATION_EXPORT void JreRelease(id obj) {
   [obj release];
 }
 
+
 FOUNDATION_EXPORT NSString *JreEnumConstantName(IOSClass *enumClass, jint ordinal) {
   const J2ObjcClassInfo *metadata = [enumClass getMetadata];
   if (metadata) {
